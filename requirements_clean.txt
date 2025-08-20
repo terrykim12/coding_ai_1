@@ -1,0 +1,52 @@
+# Qwen3-8B Local Coding AI - CUDA Optimized Version
+# GPU acceleration optimized packages
+
+# Core web framework
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+pydantic==2.5.0
+
+# AI/ML core libraries (CUDA optimized)
+# PyTorch must be installed separately:
+# pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+transformers==4.36.2
+accelerate==0.25.0
+peft==0.7.1
+
+# Quantization and memory optimization
+bitsandbytes==0.41.3
+scipy==1.11.4
+
+# Data processing
+datasets==2.15.0
+numpy==1.24.3
+pandas==2.1.4
+
+# Machine learning utilities
+scikit-learn==1.3.2
+
+# Git analysis
+pydriller==2.8
+
+# Testing and debugging
+pytest==7.4.3
+pytest-cov==4.1.0
+debugpy==1.8.0
+
+# HTTP client
+requests==2.31.0
+httpx==0.25.2
+
+# Utilities
+python-dotenv==1.0.0
+tqdm==4.66.1
+colorama==0.4.6
+
+# CUDA optimization tools
+ninja==1.11.1
+# flash-attn==2.3.6  # Flash Attention 2 (optional, complex installation)
+
+# Development tools
+black==23.11.0
+isort==5.12.0
+flake8==6.1.0

@@ -1,0 +1,46 @@
+# QLoRA SFT config for Qwen3-8B (GPU 안전 모드)
+base: "Qwen/Qwen3-8B"
+
+train_file: "training/data/train.jsonl"
+val_file:   "training/data/val.jsonl"
+
+max_seq_len: 1024  # 극도로 보수적인 시퀀스 길이
+
+lora:
+  r: 8             # 극도로 낮은 LoRA rank
+  alpha: 16
+  dropout: 0.1
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    # up_proj, down_proj, gate_proj 제거 (메모리 절약)
+
+precision:
+  bf16: true
+  fp16: false
+
+gradient_checkpointing: true
+
+optimizer:
+  name: "adamw_torch"  # bitsandbytes 불안정성 회피
+  lr: 1.0e-4      # 더 낮은 학습률
+  warmup_ratio: 0.05
+
+training:
+  epochs: 1
+  batch_size: 1
+  grad_accum: 32   # 더 큰 gradient accumulation
+  logging_steps: 5
+  eval_steps: 100
+  save_steps: 5    # 더 자주 저장 (메모리 피크 완화)
+  output_dir: "training/qlora-out"
+  resume_from_checkpoint: true  # 체크포인트에서 재개
+  
+# GPU 안전 설정
+save_strategy: "steps"
+save_total_limit: 2
+dataloader_pin_memory: false
+dataloader_num_workers: 0
+

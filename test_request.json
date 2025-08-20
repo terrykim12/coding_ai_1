@@ -1,0 +1,5 @@
+{
+  "intent": "Add negative validation to add() function",
+  "paths": ["examples/sample_py"],
+  "code_paste": "def add(a,b): return a+b"
+}

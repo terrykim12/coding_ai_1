@@ -33,6 +33,9 @@ class PathResolver:
         patterns = [f"**/*{e}" for e in self.exts]
         for pat in patterns:
             for p in glob.glob(os.path.join(self.root, pat), recursive=True):
+                # venv 폴더 제외
+                if "venv" in p or ".git" in p or "__pycache__" in p:
+                    continue
                 rp = norm_slash(os.path.relpath(p, self.root))
                 ap = norm_slash(str(Path(self.root, rp)))
                 self._all.append(ap)

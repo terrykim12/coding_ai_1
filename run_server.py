@@ -26,6 +26,10 @@ def setup_environment():
     # 환경 변수 설정
     os.environ.setdefault("QWEN_BASE_MODEL", "Qwen/Qwen3-8B")
     os.environ.setdefault("QWEN_4BIT", "true")
+    # Windows에서 4-bit 강제 사용 (기본 비활성화 가드 우회)
+    os.environ.setdefault("QWEN_FORCE_4BIT", "true")
+    # 안정적 dtype
+    os.environ.setdefault("TORCH_DTYPE", "float16")
     
     # 로깅 설정
     logging.basicConfig(

@@ -1,12 +1,17 @@
+import logging
 import os
 import re
 import math
 import glob
+from pathlib import Path
 from collections import Counter
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Dict, Any
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 import numpy as np
+
+# 로거 설정 추가
+logger = logging.getLogger(__name__)
 
 def _tokenize(s: str) -> List[str]:
     """간단한 토큰화 - Python 식별자와 특수문자 분리"""
@@ -112,66 +117,41 @@ def _read_file_safe(path: str, max_size: int = 100000) -> Optional[str]:
     except Exception:
         return None
 
-def build_context(paths=None, code_paste=None, error=None, topk=2, slice_lines=150):
-    """컨텍스트 빌드 - 토큰 절약 최적화 (더욱 가벼운 버전)"""
-    if not paths:
-        paths = ["."]
+def build_context(paths: List[str]) -> str:
+    """컨텍스트를 빌드하는 함수"""
+    context_parts = []
     
-    # 파일 수집
-    snippets = []
-    for path in paths:
-        if os.path.isfile(path):
-            try:
-                with open(path, 'r', encoding='utf-8') as f:
-                    content = f.read()
-                snippets.append((path, content))
-            except Exception as e:
-                logger.warning(f"파일 읽기 실패 {path}: {e}")
-        elif os.path.isdir(path):
-            for root, dirs, files in os.walk(path):
-                for file in files:
-                    if file.endswith(('.py', '.js', '.ts', '.java', '.cpp', '.c', '.h')):
-                        file_path = os.path.join(root, file)
-                        try:
-                            with open(file_path, 'r', encoding='utf-8') as f:
-                                content = f.read()
-                            snippets.append((file_path, content))
-                        except Exception as e:
-                            logger.warning(f"파일 읽기 실패 {file_path}: {e}")
+    for path_str in paths:
+        try:
+            file_path = Path(path_str)
+            
+            if file_path.is_file():
+                try:
+                    with open(file_path, 'r', encoding='utf-8') as f:
+                        content = f.read()
+                        context_parts.append(f"파일: {file_path}\n{content}\n{'='*50}\n")
+                except Exception as e:
+                    logger.warning(f"파일 읽기 실패 {file_path}: {e}")
+                    continue
+                    
+            elif file_path.is_dir():
+                # 디렉토리인 경우 재귀적으로 파일 탐색
+                for py_file in file_path.rglob("*.py"):
+                    try:
+                        with open(py_file, 'r', encoding='utf-8') as f:
+                            content = f.read()
+                            context_parts.append(f"파일: {py_file}\n{content}\n{'='*50}\n")
+                    except Exception as e:
+                        logger.warning(f"파일 읽기 실패 {py_file}: {e}")
+                        continue
+            else:
+                logger.warning(f"경로를 찾을 수 없음: {file_path}")
+                
+        except Exception as e:
+            logger.error(f"경로 처리 실패 {path_str}: {e}")
+            continue
     
-    if not snippets:
-        return f"Error: {error or 'No files found'}\nCode: {code_paste or 'No code'}"
-    
-    # TF-IDF 랭킹으로 Top-k 선택 (더 적게)
-    query = f"{error or ''} {code_paste or ''}"
-    top_snippets = _tfidf_rank_sklearn(snippets, query, topk=topk)
-    
-    # 컨텍스트 구성 (토큰 절약)
-    ctx_parts = []
-    
-    # 에러 메시지 (있는 경우)
-    if error:
-        ctx_parts.append(f"[ERROR]\n{error}")
-    
-    # 코드 스니펫 (있는 경우)
-    if code_paste:
-        ctx_parts.append(f"[CODE]\n{code_paste}")
-    
-    # Top-k 파일 스니펫 (라인 수 제한 - 더 적게)
-    for path, content in top_snippets:
-        lines = content.splitlines()
-        
-        # 파일당 slice_lines만큼만 사용 (토큰 절약)
-        if len(lines) > slice_lines:
-            # 에러나 코드에 나오는 키워드 근처 중심으로 슬라이스
-            snippet = "\n".join(lines[:slice_lines])
-            snippet += f"\n... (truncated, total {len(lines)} lines)"
-        else:
-            snippet = content
-        
-        ctx_parts.append(f"<<FILE {path}>>\n{snippet}\n<<END>>")
-    
-    return "\n\n".join(ctx_parts)
+    return "\n".join(context_parts) if context_parts else ""
 
 def build_context_from_error(error: str, project_root: str = ".") -> str:
     """에러 메시지만으로 컨텍스트 구축"""

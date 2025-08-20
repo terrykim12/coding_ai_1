@@ -115,15 +115,47 @@ def is_prime(n: int) -> bool:
         
     Note: 이 함수에는 버그가 있습니다 - 1을 소수로 잘못 판단합니다.
     """
-    # 버그: 1을 소수로 잘못 판단
+    # 수정: 1은 소수가 아님, 짝수 빠른 리턴, 홀수만 검사
     if n < 2:
-        return True
+        return False
     if n == 2:
         return True
-    for i in range(2, int(math.sqrt(n)) + 1):
+    if n % 2 == 0:
+        return False
+    for i in range(3, int(math.sqrt(n)) + 1, 2):
         if n % i == 0:
             return False
     return True
+
+def fibonacci(n: int) -> int:
+    """n번째 피보나치 수를 반환합니다. n<0이면 RecursionError를 발생시킵니다."""
+    if n < 0:
+        raise RecursionError("n must be >= 0")
+    a, b = 0, 1
+    for _ in range(n):
+        a, b = b, a + b
+    return a
+
+def find_primes_up_to(limit: int) -> List[int]:
+    """limit 이하의 소수 목록을 반환합니다."""
+    if limit < 2:
+        return []
+    return [x for x in range(2, limit + 1) if is_prime(x)]
+
+def find_min(numbers: List[Union[int, float]]) -> Optional[Union[int, float]]:
+    """리스트에서 최솟값 반환. 비어있으면 None"""
+    if not numbers:
+        return None
+    return min(numbers)
+
+def is_palindrome(s: str) -> bool:
+    """회문 여부(대소문자 구분)."""
+    return s == s[::-1]
+
+def count_vowels(s: str) -> int:
+    """소문자 모음(aeiou) 개수."""
+    vowels = set("aeiou")
+    return sum(1 for ch in s if ch in vowels)
 
 def calculate_average(numbers: List[Union[int, float]]) -> float:
     """

@@ -5,6 +5,135 @@ from typing import Tuple, Optional, List
 
 LEDGER_PATH = os.path.join(".llm_patch", "ledger.json")
 
+# ===== 액션 정규화 =====
+SUPPORTED_ACTIONS = {"insert_before", "insert_after", "replace_range", "delete_range", "insert_after_block"}
+ACTION_ALIASES = {
+    # insert_after_block 은 전용 분기로 처리하므로 매핑하지 않음
+    "insert_before_block": "insert_before",
+    "append": "insert_after",
+    "prepend": "insert_before",
+}
+
+def _normalize_action(edit: dict) -> dict:
+    act = str(edit.get("action", "")).lower()
+    act = ACTION_ALIASES.get(act, act)
+    edit["action"] = act
+    return edit
+
+# ===== 블록/라인 보조 유틸 =====
+_NEWLINE_RE = re.compile(r"\n")
+
+def _line_offsets(src: str):
+    offs = [0]
+    for m in _NEWLINE_RE.finditer(src):
+        offs.append(m.end())
+    return offs
+
+def _line_start_offset(src: str, line_no: int) -> int:
+    offs = _line_offsets(src)
+    if line_no <= 0:
+        return 0
+    if line_no - 1 < len(offs):
+        return offs[line_no - 1]
+    return len(src)
+
+def _pos_to_line_col(src: str, pos: int):
+    offs = _line_offsets(src)
+    lo, hi = 0, len(offs) - 1
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        if offs[mid] <= pos:
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    line = hi + 1
+    col = pos - offs[hi]
+    return line, col
+
+def _py_block_end_by_ast(src: str, line_no: int, col: int) -> int | None:
+    try:
+        tree = ast.parse(src)
+    except SyntaxError:
+        return None
+
+    best = None
+    best_span = None
+
+    BLOCK_NODES = (
+        ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef,
+        ast.If, ast.For, ast.AsyncFor, ast.While, ast.Try, ast.With, ast.AsyncWith,
+        getattr(ast, "Match", tuple())  # Py3.10+
+    )
+
+    class Finder(ast.NodeVisitor):
+        def visit(self, node):
+            nonlocal best, best_span
+            if hasattr(node, "lineno") and hasattr(node, "end_lineno"):
+                if node.lineno <= line_no <= getattr(node, "end_lineno", node.lineno):
+                    if isinstance(node, BLOCK_NODES):
+                        span = (getattr(node, "end_lineno", node.lineno) - node.lineno)
+                        if best is None or span < best_span:
+                            best = node
+                            best_span = span
+            super().visit(node)
+
+    Finder().visit(tree)
+    if best and hasattr(best, "end_lineno"):
+        return _line_start_offset(src, best.end_lineno + 1)
+    return None
+
+def _indent_level(s: str) -> int:
+    m = re.match(r"[ \t]*", s)
+    return len(m.group(0)) if m else 0
+
+def _py_block_end_by_indent(src: str, start_line: int) -> int:
+    lines = src.splitlines(True)
+    n = len(lines)
+    if start_line < 1 or start_line > n:
+        return len(src)
+    base_indent = _indent_level(lines[start_line - 1])
+    i = start_line
+    while i < n:
+        line = lines[i]
+        if line.strip() == "" or line.lstrip().startswith("#"):
+            i += 1
+            continue
+        cur_indent = _indent_level(line)
+        if cur_indent < base_indent:
+            break
+        i += 1
+    return sum(len(l) for l in lines[:i])
+
+def _find_match_pos_regex(src: str, pattern: str, flags=0) -> int | None:
+    try:
+        m = re.search(pattern, src, flags | re.MULTILINE | re.DOTALL)
+    except re.error:
+        m = re.search(re.escape(pattern), src, re.MULTILINE | re.DOTALL)
+    return m.start() if m else None
+
+def _apply_insert_after_block(src: str, edit: dict, path: str) -> tuple[str, str | None]:
+    loc = edit.get("loc") or {}
+    if not isinstance(loc, dict) or loc.get("type") != "regex" or "pattern" not in loc:
+        return src, "insert_after_block requires loc.type='regex' with 'pattern'"
+    pos = _find_match_pos_regex(src, loc["pattern"])
+    if pos is None:
+        return src, "anchor regex not found"
+    line_no, col = _pos_to_line_col(src, pos)
+    if path.endswith(".py"):
+        ins = _py_block_end_by_ast(src, line_no, col)
+        if ins is None:
+            ins = _py_block_end_by_indent(src, line_no)
+    else:
+        ins = src.find("\n", pos)
+        ins = (ins + 1) if ins != -1 else len(src)
+    text = edit.get("text", edit.get("code", ""))
+    if ins > 0 and src[ins - 1:ins] != "\n":
+        text = "\n" + text
+    if text and not text.endswith("\n"):
+        text = text + "\n"
+    new_src = src[:ins] + text + src[ins:]
+    return new_src, None
+
 # ===== 유틸리티 함수들 =====
 def _ensure_dir(path: str):
     """디렉토리 생성"""
@@ -292,6 +421,20 @@ def apply_patch_json(patch: dict, allowed_paths: Optional[List[str]] = None, dry
     
     ledger = _load_ledger()
     
+    # 액션 정규화 및 지원 미검사 선처리
+    normalized_edits: List[dict] = []
+    for e in patch.get("edits", []):
+        if not isinstance(e, dict):
+            continue
+        e = _normalize_action(e)
+        if e.get("action") not in SUPPORTED_ACTIONS:
+            report["failed"].append({"path": e.get("path", "?"), "error": f"unsupported action: {e.get('action')}"})
+            continue
+        normalized_edits.append(e)
+
+    # 정규화된 edits로 교체
+    patch["edits"] = normalized_edits
+
     for e in patch.get("edits", []):
         path = e["path"]
         action = e.get("action", "replace_range")
@@ -375,7 +518,13 @@ def apply_patch_json(patch: dict, allowed_paths: Optional[List[str]] = None, dry
         
         # 실제 편집 적용
         try:
-            if action == "insert_before":
+            if action == "insert_after_block":
+                new_text, err = _apply_insert_after_block(src, e, path)
+                if err:
+                    raise ValueError(err)
+                delta = len(new_text) - len(src)
+                src = new_text
+            elif action == "insert_before":
                 new_text = src[:r.a] + code + src[r.a:]
                 delta = len(code)
             elif action == "insert_after":
@@ -400,8 +549,15 @@ def apply_patch_json(patch: dict, allowed_paths: Optional[List[str]] = None, dry
             })
             continue
         
-        # 적용 후 Python 문법 검증 (해당 파일일 때만)
-        if applied and not dry_run and not _python_syntax_ok(path, new_text):
+        # Python 문법 검증: dry_run에서도 수행하여 사전 탐지
+        if applied and action != "insert_after_block" and not _python_syntax_ok(path, new_text):
+            if dry_run:
+                report["failed"].append({"path": path, "error": "syntax error in dry-run"})
+                report["details"].append({
+                    "path": path, "status": "failed", "action": action, 
+                    "edit_id": edit_id, "delta_chars": 0
+                })
+                continue
             report["failed"].append({"path": path, "error": "syntax error after apply — reverted"})
             report["details"].append({
                 "path": path, "status": "failed", "action": action, 

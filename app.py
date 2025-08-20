@@ -1,6 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
+Single entry that exposes the FastAPI app from server.app
+"""
+
+from server.app import app  # noqa: F401
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="127.0.0.1", port=8765)
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
 Qwen3-8B Local Coding AI - FastAPI 서버 (CUDA 최적화)
 """
 

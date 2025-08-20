@@ -16,6 +16,7 @@ Qwen3-8B 코딩 보조 AI용 SFT 데이터셋(200 샘플)을 생성합니다.
 from __future__ import annotations
 import os, json, random, pathlib, re
 from dataclasses import dataclass
+import argparse
 
 ROOT = pathlib.Path(__file__).resolve().parent
 OUT_DIR = ROOT / "training" / "data"
@@ -271,8 +272,18 @@ PLAN_GENERATORS = [
     p_dataloader_and_ddp,
 ]
 
-TOTAL = 200
-N_PATCH = 160
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("--n", type=int, default=200, help="총 샘플 개수")
+    p.add_argument("--patch_ratio", type=float, default=0.8, help="PATCH 비율 (0~1)")
+    p.add_argument("--out", type=str, default="", help="단일 출력 파일(jsonl). 지정 시 train/val 기본 출력 대신 여기에만 저장")
+    return p.parse_args()
+
+args = parse_args()
+
+TOTAL = int(args.n)
+TOTAL = TOTAL if TOTAL > 0 else 200
+N_PATCH = int(round(TOTAL * float(args.patch_ratio)))
 N_PLAN  = TOTAL - N_PATCH
 
 records: list[Record] = []
@@ -294,13 +305,20 @@ for _ in range(N_PLAN):
 random.shuffle(records)
 
 # 저장
-with open(TRAIN_PATH, "w", encoding="utf-8") as f:
-    for r in records:
-        f.write(r.as_json() + "\n")
-
-with open(VAL_PATH, "w", encoding="utf-8") as f:
-    for r in records[:60]:
-        f.write(r.as_json() + "\n")
-
-print(f"[ok] wrote {len(records)} records → {TRAIN_PATH}")
-print(f"[ok] wrote {60} records → {VAL_PATH}")
+if args.out:
+    out_path = pathlib.Path(args.out)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(out_path, "w", encoding="utf-8") as f:
+        for r in records:
+            f.write(r.as_json() + "\n")
+    print(f"[ok] wrote {len(records)} records → {out_path}")
+else:
+    with open(TRAIN_PATH, "w", encoding="utf-8") as f:
+        for r in records:
+            f.write(r.as_json() + "\n")
+    # 기본 val은 고정 60 유지(레거시)
+    with open(VAL_PATH, "w", encoding="utf-8") as f:
+        for r in records[:60]:
+            f.write(r.as_json() + "\n")
+    print(f"[ok] wrote {len(records)} records → {TRAIN_PATH}")
+    print(f"[ok] wrote {60} records → {VAL_PATH}")

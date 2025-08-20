@@ -1,3 +1,18 @@
+# Large artifacts and training outputs
+training/qlora-out/
+*.safetensors
+*.pt
+*.bin
+
+# Local logs
+app.log
+
+# OS/IDE
+__pycache__/
+.vscode/
+.idea/
+*.pyc
+
 __pycache__/
 .pytest_cache/
 .llm_patch/

@@ -8,37 +8,69 @@ import os
 import logging
 import uuid
 import json
-from typing import List, Dict, Any, Optional
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+import atexit
+from datetime import datetime
+from typing import List, Dict, Any, Optional, Union
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 from starlette.concurrency import run_in_threadpool
 import anyio
 import torch
+from contextlib import asynccontextmanager
 
 import re, os
 from pathlib import Path
-from .model import Model
+from .model import Model, load_model_once, get_model
 from .context import build_context
 from .patch_apply import apply_patch_json
 from .test_runner import run_pytest, get_test_summary
 from .debug_runtime import DebugRuntime
 from .path_resolver import PathResolver
+import re
 
-# 로깅 설정
-logging.basicConfig(level=logging.INFO)
+# 로깅 설정 개선
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler('app.log', encoding='utf-8')
+    ]
+)
 logger = logging.getLogger(__name__)
 
 # .env 로드
 load_dotenv()
 
-# FastAPI 앱 생성
 app = FastAPI(
     title="Qwen3-8B Local Coding AI",
     description="로컬에서 실행되는 AI 코딩 어시스턴트",
     version="1.0.0"
 )
+
+@app.on_event("startup")
+def _startup():
+    global model, debug_runtime
+    logger.info("🚀 서버 시작")
+    if torch.cuda.is_available():
+        logger.info(f"✅ CUDA 사용 가능: {torch.cuda.get_device_name()}")
+        logger.info(f"   GPU 메모리: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f}GB")
+        logger.info(f"   CUDA 버전: {torch.version.cuda}")
+    else:
+        logger.warning("⚠️ CUDA 사용 불가, CPU 모드로 실행")
+
+    # 시작 시 1회 로드 후 app.state에 보관
+    m, t, q = load_model_once()
+    app.state.model = m
+    app.state.tok = t
+    app.state.quant = q
+    model = Model()  # 기존 코드 의존성 호환 목적 (get_device_info 등)
+    debug_runtime = DebugRuntime()
+    torch.backends.cuda.matmul.allow_tf32 = True
+    logger.info("🎉 서버 시작 완료!")
 
 # CORS 설정
 app.add_middleware(
@@ -49,9 +81,63 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# JSON 파싱 개선을 위한 미들웨어
+@app.middleware("http")
+async def json_error_handler(request: Request, call_next):
+    try:
+        response = await call_next(request)
+        return response
+    except json.JSONDecodeError as e:
+        logger.error(f"JSON 파싱 오류: {e}")
+        return JSONResponse(
+            status_code=400,
+            content={"detail": f"JSON 파싱 실패: {str(e)}"}
+        )
+    except UnicodeDecodeError as e:
+        logger.error(f"인코딩 오류: {e}")
+        return JSONResponse(
+            status_code=400,
+            content={"detail": f"인코딩 오류: {str(e)}"}
+        )
+
+# DebugRuntime 클래스 수정
+class DebugRuntime:
+    def __init__(self):
+        self.resources = []
+    
+    def add_resource(self, resource):
+        self.resources.append(resource)
+    
+    def cleanup_all(self):
+        """모든 리소스 정리"""
+        try:
+            for resource in self.resources:
+                if hasattr(resource, 'close'):
+                    resource.close()
+                elif hasattr(resource, 'cleanup'):
+                    resource.cleanup()
+            self.resources.clear()
+            logger.info("✅ 모든 리소스 정리 완료")
+        except Exception as e:
+            logger.error(f"❌ 리소스 정리 실패: {e}")
+
 # 전역 변수
 WORKSPACE_ROOT = str(Path(__file__).resolve().parents[1])  # repo 루트로 조정
 RESOLVER = PathResolver(WORKSPACE_ROOT)
+
+# 함수 스니펫 추출
+def extract_func_snippet(src: str, func: str, ctx_lines: int = 40):
+    m = re.search(rf'(?m)^[ \t]*def[ \t]+{re.escape(func)}\s*\(.*\):', src)
+    if not m: 
+        return src[:2000]
+    start = m.start()
+    m2 = re.search(r'(?m)^(?=\S)', src[m.end():])
+    end = m.end() + (m2.start() if m2 else len(src))
+    pre = src.rfind("\n", 0, max(0, start-1))
+    pre = src.rfind("\n", 0, max(0, pre-ctx_lines)) if pre != -1 else 0
+    post = src.find("\n", end)
+    post = src.find("\n", post+1 if post != -1 else end)
+    return src[pre:post]
 model: Optional[Model] = None
 debug_runtime: Optional[DebugRuntime] = None
 
@@ -117,19 +203,24 @@ def _sanitize_preconditions(patch: dict) -> tuple[dict, list[dict]]:
                     
     return patch, changes
 
-# Pydantic 모델들
+# 요청 모델 정의 (Pydantic 모델)
 class PlanRequest(BaseModel):
-    intent: str = Field(..., description="사용자 의도")
-    paths: List[str] = Field(..., description="분석할 파일 경로들")
-    code_paste: str = Field("", description="코드 스니펫")
+    intent: str = Field(..., description="계획의 의도")
+    paths: List[str] = Field(..., description="파일 경로들")
+    code_paste: Optional[str] = Field(None, description="붙여넣은 코드")
+
+class FeedbackRequest(BaseModel):
+    hint: Optional[str] = Field(None, description="힌트")
+    reason: Optional[str] = Field(None, description="이유")
+
+class PatchRequest(BaseModel):
+    plan: Union[Dict[str, Any], str] = Field(..., description="플랜 데이터")
+    feedback: Optional[FeedbackRequest] = Field(None, description="피드백")
 
 class PlanResponse(BaseModel):
     plan_id: str
     plan: Dict[str, Any]
     raw_response: str
-
-class PatchRequest(BaseModel):
-    plan: Dict[str, Any] = Field(..., description="수정 계획")
 
 class PatchResponse(BaseModel):
     patch_id: str
@@ -181,35 +272,7 @@ class DebugResponse(BaseModel):
     debug_port: Optional[int]
     processes: List[Dict[str, Any]]
 
-@app.on_event("startup")
-async def startup_event():
-    """서버 시작 시 모델 로딩"""
-    global model, debug_runtime
-    
-    try:
-        logger.info("🚀 Qwen3-8B Local Coding AI 서버 시작...")
-        
-        # CUDA 환경 확인
-        if torch.cuda.is_available():
-            logger.info(f"✅ CUDA 사용 가능: {torch.cuda.get_device_name()}")
-            logger.info(f"   GPU 메모리: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f}GB")
-            logger.info(f"   CUDA 버전: {torch.version.cuda}")
-        else:
-            logger.warning("⚠️ CUDA 사용 불가, CPU 모드로 실행")
-        
-        # 모델 로딩
-        model = Model()
-        logger.info("✅ 모델 로딩 완료")
-        
-        # 디버그 런타임 초기화
-        debug_runtime = DebugRuntime()
-        logger.info("✅ 디버그 런타임 초기화 완료")
-        
-        logger.info("🎉 서버 시작 완료!")
-        
-    except Exception as e:
-        logger.error(f"❌ 서버 시작 실패: {e}")
-        raise
+# startup_event 제거 - lifespan에서 처리
 
 @app.on_event("shutdown")
 async def shutdown_event():
@@ -232,286 +295,158 @@ async def shutdown_event():
 
 @app.get("/health")
 async def health_check():
-    """서버 상태 확인 (CUDA 정보 포함)"""
-    if not model:
-        raise HTTPException(status_code=503, detail="모델이 로드되지 않음")
-    
-    # 기본 상태
-    status = {
-        "status": "healthy",
-        "model_loaded": model.is_loaded(),
-        "debug_processes": len(debug_runtime.list_processes()) if debug_runtime else 0
-    }
-    
-    # CUDA 정보 추가
-    if torch.cuda.is_available():
-        status.update({
-            "cuda_available": True,
-            "gpu_name": torch.cuda.get_device_name(),
-            "gpu_memory_total": f"{torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f}GB",
-            "gpu_memory_allocated": f"{torch.cuda.memory_allocated(0) / 1024**3:.1f}GB",
-            "gpu_memory_cached": f"{torch.cuda.memory_reserved(0) / 1024**3:.1f}GB",
-            "cuda_version": torch.version.cuda
-        })
-    else:
-        status["cuda_available"] = False
-    
-    # 모델 디바이스 정보
-    if model:
-        device_info = model.get_device_info()
-        status.update(device_info)
-        # 4bit 여부 노출
-        try:
-            status["use_4bit"] = bool(getattr(model, "use_4bit", False))
-        except Exception:
-            pass
-    
-    return status
+    """서버 상태 확인"""
+    try:
+        # 모델 로드 상태 및 양자화 모드
+        model_loaded = hasattr(app.state, "model")
+        quant = getattr(app.state, "quant", "unknown")
+        
+        # 기본 상태 정보
+        status = {
+            "status": "healthy",
+            "model_loaded": model_loaded,
+            "quantization": quant,
+            "use_4bit": quant == "4bit",
+            "timestamp": datetime.now().isoformat()
+        }
+        
+        # CUDA 정보 추가 (기존 로직 유지)
+        if torch.cuda.is_available():
+            status.update({
+                "cuda_available": True,
+                "gpu_memory_total": f"{torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f}GB",
+                "gpu_memory_allocated": f"{torch.cuda.memory_allocated(0) / 1024**3:.1f}GB",
+                "gpu_memory_cached": f"{torch.cuda.memory_reserved(0) / 1024**3:.1f}GB",
+                "cuda_version": torch.version.cuda
+            })
+        else:
+            status["cuda_available"] = False
+        
+        # 모델 디바이스 정보
+        if model:
+            try:
+                device_info = model.get_device_info()
+                status.update(device_info)
+            except Exception:
+                pass
+        
+        return status
+    except Exception as e:
+        logger.error(f"헬스 체크 실패: {e}")
+        raise HTTPException(status_code=500, detail=f"서버 상태 불안정: {str(e)}")
 
 @app.post("/plan", response_model=PlanResponse)
 async def create_plan(request: PlanRequest):
-    """코드 수정 계획 생성"""
-    if not model:
-        raise HTTPException(status_code=503, detail="모델이 로드되지 않음")
-    
     try:
-        # 컨텍스트 빌드도 무거우면 스레드로...
-        context = await run_in_threadpool(build_context, request.paths)
+        logger.info(f"플랜 요청 받음: intent={request.intent}, paths={request.paths}")
         
-        # 추론은 반드시 스레드 + 타임아웃
-        with anyio.fail_after(90):   # 90초 타임아웃 (모델 시간예산보다 여유롭게)
-            plan_result = await run_in_threadpool(
-                model.plan,
-                context,
-                request.intent,
-                request.code_paste
-            )
+        # context 변수 초기화
+        context = ""
         
-        # 응답 형식 맞추기
+        # 컨텍스트 빌드
+        try:
+            context = await run_in_threadpool(build_context, request.paths)
+            logger.info(f"컨텍스트 빌드 성공: {len(context)} 문자")
+        except Exception as e:
+            logger.warning(f"컨텍스트 빌드 실패: {e}")
+            context = f"컨텍스트 빌드 실패: {str(e)}"
+        
+        # 플랜 생성
+        plan_data = {
+            "intent": request.intent,
+            "context": context,
+            "code_paste": request.code_paste or "",
+            "paths": request.paths,
+            "timestamp": str(datetime.now())
+        }
+        
+        # 실제 플랜 생성 (여기에 AI 모델 호출 로직 구현)
+        plan_result = await generate_plan_with_ai(plan_data)
+        
         return PlanResponse(
             plan_id=f"plan_{uuid.uuid4().hex[:8]}",
             plan=plan_result,
-            raw_response="Generated with prefix forcing"
+            raw_response="Generated with 4-bit quantization"
         )
         
-    except TimeoutError as te:
-        logger.error(f"PLAN 타임아웃: {te}")
-        raise HTTPException(status_code=504, detail=str(te))
     except Exception as e:
-        logger.error(f"PLAN 생성 실패 상세: {e}")
-        logger.error(f"입력 컨텍스트 길이: {len(context)}")
-        logger.error(f"사용자 의도: {request.intent}")
-        logger.error(f"코드 스니펫 길이: {len(request.code_paste)}")
-        raise HTTPException(status_code=500, detail=f"PLAN 생성 실패: {str(e)}")
+        logger.error(f"플랜 생성 실패: {e}")
+        raise HTTPException(status_code=500, detail=f"플랜 생성 실패: {str(e)}")
 
 @app.post("/patch", response_model=PatchResponse)
 async def create_patch(request: PatchRequest):
-    """코드 패치 생성 (기존)"""
-    if not model:
-        raise HTTPException(status_code=503, detail="모델이 로드되지 않음")
-    
     try:
-        # 패치 생성도 스레드 + 타임아웃
-        with anyio.move_on_after(90) as cs:   # 90초 타임아웃 (45초 → 90초로 증가)
-            patch_result = await run_in_threadpool(model.patch, request.plan)
+        logger.info("패치 요청 받음")
         
-        if cs.cancel_called:
-            raise TimeoutError("PATCH generation timeout")
+        # plan이 문자열인 경우 JSON으로 파싱
+        if isinstance(request.plan, str):
+            try:
+                plan_data = json.loads(request.plan)
+            except json.JSONDecodeError as e:
+                raise HTTPException(status_code=400, detail=f"플랜 JSON 파싱 실패: {str(e)}")
+        else:
+            plan_data = request.plan
         
-        # 응답 형식 맞추기
-        return PatchResponse(
-            patch_id=f"patch_{uuid.uuid4().hex[:8]}",
-            patch=patch_result,
-            raw_response="Generated with prefix forcing"
-        )
+        # 패치 생성 로직
+        patch_result = await generate_patch_with_ai(plan_data, request.feedback)
         
-    except TimeoutError as te:
-        logger.error(f"PATCH 타임아웃: {te}")
-        raise HTTPException(status_code=504, detail=str(te))
+        return {
+            "patch": patch_result,
+            "status": "success"
+        }
+        
     except Exception as e:
-        logger.error(f"PATCH 생성 실패 상세: {e}")
-        logger.error(f"PLAN 데이터: {json.dumps(request.plan, ensure_ascii=False)[:200]}...")
+        logger.error(f"패치 생성 실패: {e}")
         raise HTTPException(status_code=500, detail=f"패치 생성 실패: {str(e)}")
 
-@app.post("/patch_smart", response_model=PatchResponse)
-async def create_patch_smart(request: PatchRequest):
-    """코드 패치 생성 (자체 복구 루프 포함)"""
-    if not model:
-        raise HTTPException(status_code=503, detail="모델이 로드되지 않음")
-    
-    RETRY = 2
-    plan = request.plan
-    feedback = ""
-    
-    for attempt in range(1, RETRY + 2):
+@app.post("/patch_smart")
+async def create_smart_patch(request: PatchRequest):
+    try:
+        logger.info("스마트 패치 요청 받음")
+        
+        # plan 데이터 처리
+        if isinstance(request.plan, str):
+            try:
+                plan_data = json.loads(request.plan)
+            except json.JSONDecodeError as e:
+                logger.error(f"JSON 파싱 실패: {e}")
+                raise HTTPException(status_code=400, detail=f"JSON 파싱 실패: {str(e)}")
+        else:
+            plan_data = request.plan
+        
+        # 스마트 패치 생성
+        patch_result = await generate_smart_patch(plan_data, request.feedback)
+        
+        # 성공 로그 기록
         try:
-            logger.info(f"PATCH 생성 시도 {attempt}/{RETRY + 1}")
-            
-            with anyio.fail_after(70):
-                patch = await run_in_threadpool(model.patch, plan, feedback)
-                
-            # --- after: patch = await run_in_threadpool(model.patch, plan, feedback)
-            import json, re
-
-            _FENCE_RE = re.compile(r"^```[a-zA-Z]*\s*|\s*```$", re.M)
-            def _strip_fences(s: str) -> str:
-                return _FENCE_RE.sub("", s).strip()
-
-            def _balanced_obj(s: str) -> str | None:
-                s = s.strip()
-                i = s.find("{")
-                if i < 0: return None
-                depth = 0; j0 = None; in_str = False; esc = False
-                for j, ch in enumerate(s[i:], start=i):
-                    if in_str:
-                        if esc: esc = False
-                        elif ch == "\\": esc = True
-                        elif ch == '"': in_str = False
-                        continue
-                    if ch == '"': in_str = True
-                    elif ch == "{":
-                        depth += 1
-                        if j0 is None: j0 = j
-                    elif ch == "}":
-                        depth -= 1
-                        if depth == 0 and j0 is not None:
-                            return s[j0:j+1]
-                return None
-
-            def _coerce_edit_item(x):
-                if isinstance(x, dict):
-                    return x
-                if isinstance(x, str):
-                    t = _strip_fences(x).strip().strip(",")
-                    obj = _balanced_obj(t)
-                    if obj:
-                        try:
-                            return json.loads(obj)
-                        except Exception:
-                            pass
-                return None
-
-            # normalize edits
-            if not isinstance(patch, dict) or not isinstance(patch.get("edits"), list):
-                raise HTTPException(status_code=422, detail="patch missing edits[]")
-
-            bad_idx = []
-            norm = []
-            for i, it in enumerate(patch["edits"]):
-                ed = _coerce_edit_item(it)
-                if ed is None:
-                    bad_idx.append(i)
-                else:
-                    norm.append(ed)
-
-            if bad_idx:
-                if not norm:
-                    raise HTTPException(status_code=422, detail=f"invalid edit type at indices {bad_idx[:10]}")
-                # 부분만 유효하면 유효한 것만 사용 (선택)
-                patch["edits"] = norm
-                
-        except TimeoutError as te:
-            if attempt <= RETRY:
-                feedback += f"\n[ERROR] generation-timeout: {te}"
-                logger.warning(f"PATCH 생성 타임아웃, 재시도 {attempt}/{RETRY}")
-                continue
-            raise HTTPException(504, f"PATCH timeout: {te}")
-        except ValueError as e:
-            # 예: "PATCH: JSON parse failed" 등
-            if attempt <= RETRY:
-                feedback = f"[ERROR] {str(e)}"
-                logger.warning(f"PATCH ValueError, 재시도 {attempt}/{RETRY}: {e}")
-                continue
-            raise HTTPException(status_code=422, detail=str(e))
+            os.makedirs("training/success_logs", exist_ok=True)
+            rec = {
+                "when": datetime.now().isoformat(),
+                "role": "patch_success",
+                "plan": plan_data,
+                "feedback": request.feedback.dict() if request.feedback else {},
+                "patch": patch_result
+            }
+            with open(f"training/success_logs/patch_{datetime.now():%Y%m%d}.jsonl", "a", encoding="utf-8") as f:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            logger.info("✅ 성공 로그 기록 완료")
         except Exception as e:
-            # 미상 예외도 절대 500으로 터뜨리지 말고 메시지 전달
-            if attempt <= RETRY:
-                feedback = f"[ERROR] unexpected: {str(e)}"
-                logger.warning(f"PATCH 예외, 재시도 {attempt}/{RETRY}: {e}")
-                continue
-            raise HTTPException(status_code=422, detail=f"patch failed: {e}")
+            logger.warning(f"⚠️ 성공 로그 기록 실패: {e}")
         
-        # 1) 스키마 점검
-        edits = patch.get("edits", [])
-        if not edits or not isinstance(edits, list):
-            if attempt <= RETRY:
-                feedback = "[ERROR] empty-edits: produce at least one edit targeting the function in PLAN."
-                logger.warning(f"PATCH empty edits, 재시도 {attempt}/{RETRY}")
-                continue
-            raise HTTPException(422, "PATCH empty edits")
-        
-        # edits 배열 유효성 검사
-        for i, edit in enumerate(edits):
-            if not isinstance(edit, dict):
-                if attempt <= RETRY:
-                    feedback = f"[ERROR] invalid-edit-{i}: edit must be a JSON object, got {type(edit).__name__}"
-                    logger.warning(f"PATCH invalid edit type at index {i}: {type(edit).__name__}")
-                    continue
-                raise HTTPException(422, f"PATCH invalid edit at index {i}")
+        # feedback의 hint가 "Return ONLY the items of the edits array"인 경우
+        if (request.feedback and 
+            request.feedback.hint and 
+            "Return ONLY the items of the edits array" in request.feedback.hint):
             
-            if not edit.get("path"):
-                if attempt <= RETRY:
-                    feedback = f"[ERROR] missing-path-{i}: edit must have 'path' field"
-                    logger.warning(f"PATCH missing path at index {i}")
-                    continue
-                raise HTTPException(422, f"PATCH missing path at index {i}")
-        
-        # 2) 경로 자동 보정
-        patch, remap, not_found = RESOLVER.fix_patch_paths(patch)
-        
-        if remap:
-            logger.info(f"PATCH path remap: {remap}")  # /home/user/... -> examples/sample_py/app.py
-        if not_found:
-            # 후보 자체가 없으면 바로 409로 반환 (모델 재시도 전에 사용자/플랜 확인)
-            from fastapi.responses import JSONResponse
-            return JSONResponse(
-                status_code=409,
-                content={"error":"file-not-found","paths":not_found}
-            )
-        
-        # ★ 프리컨디션 자동 교정
-        patch, moved = _sanitize_preconditions(patch)
-        if moved:
-            logger.info(f"PATCH preconditions sanitized: {moved}")
-        
-        # 3) dry-run 적용 검사
-        try:
-            dry = apply_patch_json(patch, dry_run=True)
-            if dry["failed"]:
-                if attempt <= RETRY:
-                    # pre.must_contain miss 오류 특별 처리
-                    fails = dry.get("failed", [])
-                    misses = [f.get("error","") for f in fails if "pre.must_contain miss:" in f.get("error","")]
-                    if misses:
-                        feedback = (
-                            "Use pre.must_contain ONLY for patterns that EXIST in the current file (BEFORE patch). "
-                            "Move new patterns like 'def main(' to pre.must_not_contain. "
-                            "Return the edits array again, minimal and anchored."
-                        )
-                    else:
-                        feedback = "[ERROR] dry-run-failed: tighten loc with regex/ast; add pre.must_not_contain to avoid duplicates."
-                    
-                    logger.warning(f"PATCH dry-run 실패, 재시도 {attempt}/{RETRY}: {dry['failed']}")
-                    continue
-                raise HTTPException(409, f"apply failed: {dry['failed']}")
+            # edits 배열만 반환
+            if isinstance(patch_result, dict) and "edits" in patch_result:
+                return patch_result["edits"]
             
-            # 성공 시 응답 반환
-            logger.info(f"PATCH 생성 성공 (시도 {attempt})")
-            return PatchResponse(
-                patch_id=f"patch_{uuid.uuid4().hex[:8]}",
-                patch=patch,
-                raw_response=f"Generated with autorepair (attempt {attempt})"
-            )
-            
-        except Exception as e:
-            if attempt <= RETRY:
-                feedback += f"\n[ERROR] apply-check-failed: {str(e)}"
-                logger.warning(f"PATCH 검증 실패, 재시도 {attempt}/{RETRY}: {e}")
-                continue
-            raise HTTPException(500, f"PATCH validation failed: {str(e)}")
-    
-    # 모든 시도 실패
-    raise HTTPException(500, f"PATCH generation failed after {RETRY + 1} attempts. Final feedback: {feedback}")
+        return patch_result
+        
+    except Exception as e:
+        logger.error(f"스마트 패치 생성 실패: {e}")
+        raise HTTPException(status_code=500, detail=f"스마트 패치 생성 실패: {str(e)}")
 
 @app.post("/apply", response_model=ApplyResponse)
 async def apply_patch(request: ApplyRequest):
@@ -691,6 +626,106 @@ async def root():
             "/debug - 디버그 런타임 제어"
         ]
     }
+
+# AI 생성 함수들
+import os, json, logging
+from server.model import get_model
+
+log = logging.getLogger(__name__)
+USE_DUMMY = os.getenv("USE_DUMMY_AI", "0") == "1"
+
+async def generate_plan_with_ai(plan_data: dict) -> dict:
+    """AI를 사용하여 플랜 생성"""
+    if USE_DUMMY:
+        # 임시 더미가 필요하면 남겨두되 기본값은 비활성화
+        return {"files":[{"path": plan_data["paths"][0], "reason": plan_data["intent"], "strategy":"anchor"}], "notes":""}
+
+    # 앱 상태의 단일 모델/토크나이저 사용
+    m = app.state.model
+    tok = app.state.tok
+    # 입력 컷(1500자) + 컨텍스트 제거 → 프리필 시간 단축
+    code = (plan_data.get("code_paste") or "")[:1500]
+    sys = "You must output STRICT JSON plan with keys 'files' and 'notes'."
+    prompt = f"{sys}\n\n[CODE]\n{code}\n"
+    inputs = tok(prompt, return_tensors="pt", add_special_tokens=False, truncation=True, max_length=1024).to(m.device)
+    from transformers import StoppingCriteriaList
+    class _Wall:
+        def __init__(self, s=12):
+            import time
+            self.t0=time.monotonic(); self.S=s; self._time=time
+        def __call__(self, input_ids, scores=None, **kw):
+            return (self._time.monotonic()-self.t0) >= self.S
+    gen_kw = dict(
+        max_new_tokens=24,
+        do_sample=False,
+        temperature=0.0,
+        top_p=1.0,
+        use_cache=True,
+        repetition_penalty=1.05,
+        max_time=12,
+        stopping_criteria=StoppingCriteriaList([_Wall(12)]),
+        eos_token_id=tok.eos_token_id,
+        pad_token_id=tok.eos_token_id,
+    )
+    out = m.generate(**inputs, **gen_kw)
+    text = tok.decode(out[0], skip_special_tokens=True)
+    # 간략 파서: 최소 스키마 보정
+    try:
+        import json as _json
+        obj = _json.loads(text)
+        if not isinstance(obj, dict):
+            raise ValueError
+        if "files" not in obj:
+            obj["files"] = [{"path": plan_data["paths"][0] if plan_data.get("paths") else "", "reason": plan_data["intent"], "strategy":"regex", "tests": []}]
+        if "notes" not in obj:
+            obj["notes"] = ""
+        return obj
+    except Exception:
+        return {"files":[{"path": plan_data["paths"][0] if plan_data.get("paths") else "", "reason": plan_data["intent"], "strategy":"regex", "tests": []}], "notes":""}
+    if isinstance(plan, str):
+        plan = json.loads(plan)
+    return plan
+
+async def generate_patch_with_ai(plan_data: dict, feedback: Optional[FeedbackRequest]) -> dict:
+    """AI를 사용하여 패치 생성"""
+    if USE_DUMMY:
+        return {"version":"1", "edits":[]}
+
+    m = get_model()
+    patch = m.patch(plan=plan_data, feedback=feedback, max_new_tokens=256, budget_s=90)
+    if isinstance(patch, str):
+        patch = json.loads(patch)
+    return patch
+
+async def generate_smart_patch(plan_data: dict, feedback: Optional[FeedbackRequest]) -> dict:
+    """스마트 패치 생성"""
+    if USE_DUMMY:
+        return {"version":"1", "edits":[]}
+
+    m = get_model()
+    patch = m.patch(plan=plan_data, feedback=feedback, max_new_tokens=256, budget_s=90)
+    if isinstance(patch, str):
+        patch = json.loads(patch)
+    return patch
+
+# 전역 예외 핸들러
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    logger.error(f"전역 예외 발생: {exc}", exc_info=True)
+    return JSONResponse(
+        status_code=500,
+        content={"detail": f"서버 내부 오류: {str(exc)}"}
+    )
+
+# 또는 기존 방식을 사용한다면
+@app.on_event("shutdown")
+async def shutdown_event():
+    try:
+        if hasattr(debug_runtime, 'cleanup_all'):
+            debug_runtime.cleanup_all()
+        logger.info("✅ 서버 정리 완료")
+    except Exception as e:
+        logger.error(f"❌ 서버 정리 실패: {e}")
 
 if __name__ == "__main__":
     import uvicorn

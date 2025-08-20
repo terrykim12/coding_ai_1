@@ -293,7 +293,9 @@ def train_model(config: Dict[str, Any]):
         )
         
         # 9. 학습 인수 설정
-        training_args = TrainingArguments(
+        # warmup_ratio가 None이면 인자를 전달하지 않도록 처리
+        _warmup_ratio = config.get("warmup_ratio", None)
+        _ta_kwargs = dict(
             output_dir=config["output_dir"],
             num_train_epochs=config["num_train_epochs"],
             per_device_train_batch_size=config["per_device_train_batch_size"],
@@ -302,7 +304,7 @@ def train_model(config: Dict[str, Any]):
             learning_rate=config["learning_rate"],
             lr_scheduler_type=config["lr_scheduler_type"],
             warmup_steps=config["warmup_steps"],
-            warmup_ratio=config.get("warmup_ratio", None),  # ← 추가 (있으면 사용)
+            # warmup_ratio는 아래에서 조건부로 세팅
             logging_steps=config["logging_steps"],
             save_steps=config["save_steps"],
             eval_steps=config["eval_steps"] if eval_dataset is not None else None,
@@ -319,6 +321,10 @@ def train_model(config: Dict[str, Any]):
             report_to=None,  # wandb 등 비활성화
             run_name="qwen3-qlora-training"
         )
+        if _warmup_ratio is not None:
+            _ta_kwargs["warmup_ratio"] = float(_warmup_ratio)
+
+        training_args = TrainingArguments(**_ta_kwargs)
         
         # 10. 트레이너 생성 및 학습
         trainer = Trainer(

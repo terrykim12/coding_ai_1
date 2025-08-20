@@ -16,10 +16,154 @@ from transformers import (
     AutoModelForCausalLM, 
     BitsAndBytesConfig,
     StoppingCriteria,
-    StoppingCriteriaList
+    StoppingCriteriaList,
+    TextIteratorStreamer
 )
 from peft import PeftModel
+import threading
 import logging
+
+# ---- 싱글톤 양자화 로더 (8-bit/4-bit 강제 적용) ----
+BASE = os.getenv("MODEL_PATH") or os.getenv("QWEN_BASE_MODEL") or "Qwen/Qwen3-8B"
+_model = None
+_tok = None
+_lock = threading.Lock()
+_quant = "none"  # "4bit" | "8bit" | "none"
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    v = os.getenv(name)
+    if v is None:
+        return default
+    return str(v).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+def load_model_once():
+    """
+    BitsAndBytesConfig로 4bit/8bit 양자화를 명시 적용하고, 단 한 번만 로드한다.
+    반환: (model, tokenizer, quantization_mode)
+    """
+    global _model, _tok, _quant
+    if _model is not None:
+        return _model, _tok, _quant
+    with _lock:
+        if _model is not None:
+            return _model, _tok, _quant
+
+        use_4bit = _env_bool("QWEN_4BIT", False)
+        # 8-bit 기본 활성화, 단 4bit가 켜져 있으면 8bit는 비활성
+        use_8bit = _env_bool("QWEN_8BIT", True) and (not use_4bit)
+
+        bnb = None
+        if use_4bit:
+            bnb = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_use_double_quant=True,
+                bnb_4bit_compute_dtype=torch.bfloat16,
+            )
+            _quant = "4bit"
+        elif use_8bit:
+            bnb = BitsAndBytesConfig(load_in_8bit=True)
+            _quant = "8bit"
+        else:
+            _quant = "none"
+
+        torch_dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float16
+        _tok = AutoTokenizer.from_pretrained(BASE, use_fast=True, trust_remote_code=True)
+        _model = AutoModelForCausalLM.from_pretrained(
+            BASE,
+            device_map={"": 0},
+            torch_dtype=torch_dtype,
+            quantization_config=bnb,
+            low_cpu_mem_usage=True,
+            trust_remote_code=True,
+        )
+
+        # LoRA 어댑터 (있는 경우 한 번만 로드)
+        adapter_path = os.getenv("ADAPTER_PATH", "training/qlora-out/adapter")
+        if adapter_path and os.path.exists(adapter_path):
+            _model = PeftModel.from_pretrained(_model, adapter_path)
+
+        # SDPA 강제 시도
+        try:
+            _model.config.attn_implementation = "sdpa"
+        except Exception:
+            pass
+
+        _model.eval()
+
+        # 안전장치: 양자화 미적용이면 즉시 오류 (12GB VRAM에서 OOM 방지)
+        if _quant == "none" and not getattr(_model, "is_loaded_in_8bit", False) \
+           and not getattr(_model, "is_loaded_in_4bit", False):
+            raise RuntimeError("Quantization not applied; would OOM on 12GB.")
+
+        return _model, _tok, _quant
+
+# ---- 시간 예산 스토핑 ---
+import time
+from transformers import StoppingCriteria, StoppingCriteriaList
+
+class WallClockBudget(StoppingCriteria):
+    def __init__(self, budget_s=30):
+        self.t0 = time.monotonic()
+        self.budget = budget_s
+    def __call__(self, input_ids, scores, **kwargs):
+        return (time.monotonic() - self.t0) >= self.budget
+
+# ---- PLAN 스트리밍 조기 종료 (공용 함수) ----
+class StopOnBalancedObject(StoppingCriteria):
+    def __init__(self, buf, t0, budget_s: int = 45, assume_open_brace: bool = False):
+        self.buf = buf
+        self.t0 = t0
+        self.budget = budget_s
+        self.assume_open_brace = assume_open_brace
+    def __call__(self, input_ids, scores=None, **kw):
+        import time as _t
+        if _t.time() - self.t0 > self.budget:
+            return True
+        s = "".join(self.buf).replace("```", "").strip()
+        # 프리픽스에 '{'를 이미 넣은 경우, 균형 계산에 반영
+        if self.assume_open_brace and (not s.startswith("{")):
+            s = "{" + s
+        i = s.find("{")
+        if i < 0:
+            return False
+        depth = 0; in_str = False; esc = False
+        for ch in s[i:]:
+            if in_str:
+                if esc: esc = False
+                elif ch == "\\": esc = True
+                elif ch == '"': in_str = False
+            else:
+                if ch == '"': in_str = True
+                elif ch == '{': depth += 1
+                elif ch == '}':
+                    depth -= 1
+                    if depth == 0:
+                        return True
+        return False
+
+def generate_plan_text(prompt: str, tokenizer, model, max_new_tokens: int = 64, budget_s: int = 45, assume_open_brace: bool = False) -> str:
+    streamer = TextIteratorStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
+    buf: list[str] = []
+    def _collector():
+        for t in streamer:
+            buf.append(t)
+    th = threading.Thread(target=_collector, daemon=True); th.start()
+    import time as _t
+    stopper = StopOnBalancedObject(buf, _t.time(), budget_s=budget_s, assume_open_brace=assume_open_brace)
+    gen_inputs = tokenizer(prompt, return_tensors="pt", add_special_tokens=False).to(model.device)
+    with torch.inference_mode():
+        gen_kwargs = dict(
+            do_sample=False,
+            max_new_tokens=max_new_tokens,
+            eos_token_id=tokenizer.eos_token_id,
+            pad_token_id=tokenizer.eos_token_id,
+            use_cache=True,
+            stopping_criteria=StoppingCriteriaList([stopper, WallClockBudget(budget_s)])
+        )
+        model.generate(**gen_inputs, **gen_kwargs, streamer=streamer)
+    th.join(timeout=1.0)
+    return "".join(buf)
 
 # --- PLAN 파싱 유틸리티 ---
 _OBJ_HINT = re.compile(r'\"files\"\s*:\s*\[', re.S)
@@ -170,66 +314,53 @@ class Model:
         logger.info(f"데이터 타입: {self.torch_dtype}")
         logger.info(f"4-bit 양자화 사용: {self.use_4bit}")
 
+        # SDPA 및 TF32 행렬곱 최적화
+        try:
+            torch.backends.cuda.matmul.allow_tf32 = True
+        except Exception:
+            pass
+        try:
+            torch.set_float32_matmul_precision("high")
+        except Exception:
+            pass
+
         self._load_model()
         logger.info("✅ 모델 로딩 완료!")
 
     def _load_model(self):
-        """모델 및 토크나이저 로딩"""
+        """모델 및 토크나이저 로딩 - 싱글톤 로더 사용"""
         try:
-            # 토크나이저 로딩
-            self.tokenizer = AutoTokenizer.from_pretrained(
-                self.model_path,
-                use_fast=True,
-                trust_remote_code=True
-            )
-            
-            # EOS 토큰 설정
+            model, tokenizer, quant = load_model_once()
+            self.model = model
+            self.tokenizer = tokenizer
+            self.use_4bit = (quant == "4bit")
+            self.quantization = quant
+
+            # EOS 토큰 보정
             if self.tokenizer.eos_token is None:
                 self.tokenizer.eos_token = "<|endoftext|>"
-            
-            # 양자화/비양자화 설정
-            if self.device == "cuda" and self.use_4bit:
-                try:
-                    bnb_config = BitsAndBytesConfig(
-                        load_in_4bit=True,
-                        bnb_4bit_use_double_quant=True,
-                        bnb_4bit_quant_type="nf4",
-                        bnb_4bit_compute_dtype=getattr(torch, self.torch_dtype)
-                    )
-                    self.model = AutoModelForCausalLM.from_pretrained(
-                        self.model_path,
-                        quantization_config=bnb_config,
-                        device_map={"": "cuda:0"},
-                        trust_remote_code=True,
-                        torch_dtype=getattr(torch, self.torch_dtype),
-                        attn_implementation="sdpa"
-                    )
-                except Exception as qe:
-                    logger.error(f"4-bit 로딩 실패, 비양자화로 폴백합니다: {qe}")
-                    self.use_4bit = False
-                    # 폴백: 비양자화 로딩
-                    self.model = AutoModelForCausalLM.from_pretrained(
-                        self.model_path,
-                        trust_remote_code=True,
-                        torch_dtype=getattr(torch, self.torch_dtype),
-                        device_map={"": "cuda:0"},
-                        attn_implementation="sdpa"
-                    )
-            else:
-                # CPU 모드
-                self.model = AutoModelForCausalLM.from_pretrained(
-                    self.model_path,
-                    trust_remote_code=True,
-                    torch_dtype=getattr(torch, self.torch_dtype),
-                    device_map={"": self.device if self.device == "cuda" else "cpu"},
-                    attn_implementation="sdpa"
-                )
-            
-            # LoRA 어댑터 로딩 (있는 경우)
-            if self.adapter_path and os.path.exists(self.adapter_path):
-                logger.info(f"LoRA 어댑터 로딩: {self.adapter_path}")
-                self.model = PeftModel.from_pretrained(self.model, self.adapter_path)
-            
+
+            # 생성 공통 설정(PLAN/PATCH) 고정
+            self.PLAN_GEN_KW = dict(
+                do_sample=False,
+                max_new_tokens=24,  # 더 축소
+                temperature=0.0,
+                top_p=1.0,
+                repetition_penalty=1.1,  # 루프 억제 강하게
+                eos_token_id=self.tokenizer.eos_token_id,
+                pad_token_id=self.tokenizer.eos_token_id,
+                use_cache=True,
+            )
+            self.PATCH_GEN_KW = dict(
+                do_sample=False,
+                max_new_tokens=256,  # PATCH는 256~512로 유지
+                temperature=0.0,
+                top_p=1.0,
+                repetition_penalty=1.03,  # PATCH용 적당한 루프 억제
+                eos_token_id=self.tokenizer.eos_token_id,
+                pad_token_id=self.tokenizer.eos_token_id,
+                use_cache=True,
+            )
             self.model.eval()
             
         except Exception as e:
@@ -245,13 +376,7 @@ class Model:
         inputs = self.tokenizer(prefix, return_tensors="pt", add_special_tokens=False).to(self.model.device)
 
         with torch.inference_mode():
-            # 샘플링 파라미터 제거하여 경고 방지
-            gen_kwargs = {
-                "max_new_tokens": max_new_tokens,
-                "do_sample": False,
-                "eos_token_id": self.tokenizer.eos_token_id,
-                "pad_token_id": self.tokenizer.eos_token_id
-            }
+            gen_kwargs = dict(self.PLAN_GEN_KW)
             out = self.model.generate(**inputs, **gen_kwargs)
 
         full = self.tokenizer.decode(out[0], skip_special_tokens=True)
@@ -273,7 +398,7 @@ class Model:
         
         return gen
 
-    def _gen_plan(self, context_str: str, intent: str, max_new_tokens=192, time_budget_s=70):
+    def _gen_plan(self, context_str: str, intent: str, max_new_tokens=32, time_budget_s=30):
         """시간 예산이 적용된 PLAN 생성"""
         t0 = time.perf_counter()
         
@@ -289,22 +414,10 @@ class Model:
         prefix = prompt + START_PLAN + "{"
         inputs = self.tokenizer(prefix, return_tensors="pt", add_special_tokens=False).to(self.model.device)
 
-        # 시간 예산 설정
-        deadline = time.perf_counter() + time_budget_s
-        stops = StoppingCriteriaList([StopOnTime(deadline)])
-
-        with torch.inference_mode():
-            # 샘플링 파라미터 제거하여 경고 방지
-            gen_kwargs = {
-                "max_new_tokens": max_new_tokens,
-                "do_sample": False,
-                "eos_token_id": self.tokenizer.eos_token_id,
-                "pad_token_id": self.tokenizer.eos_token_id,
-                "stopping_criteria": stops
-            }
-            out = self.model.generate(**inputs, **gen_kwargs)
-
-        full = self.tokenizer.decode(out[0], skip_special_tokens=True)
+        # 스트리밍 조기 종료 공용 함수 사용
+        # prefix는 '{'로 끝남 → stopper에 assume_open_brace=True로 전달
+        streamed = generate_plan_text(prefix, self.tokenizer, self.model, max_new_tokens=max_new_tokens, budget_s=time_budget_s, assume_open_brace=True)
+        full = prompt + streamed
         gen = full[len(prompt):]  # 모델이 생성한 부분만
 
         if START_PLAN in gen:
@@ -344,12 +457,9 @@ class Model:
         inputs = self.tokenizer(prefix, return_tensors="pt", add_special_tokens=False).to(self.model.device)
         
         with torch.inference_mode():
-            gen_kwargs = {
-                "max_new_tokens": 64,  # 짧게
-                "do_sample": False,
-                "eos_token_id": self.tokenizer.eos_token_id,
-                "pad_token_id": self.tokenizer.eos_token_id
-            }
+            gen_kwargs = dict(self.PLAN_GEN_KW)
+            gen_kwargs["max_new_tokens"] = 16  # 더 짧게
+            gen_kwargs["stopping_criteria"] = StoppingCriteriaList([WallClockBudget(3)])  # 3초 예산
             out = self.model.generate(**inputs, **gen_kwargs)
         
         full = self.tokenizer.decode(out[0], skip_special_tokens=True)
@@ -365,7 +475,7 @@ class Model:
     def plan(self, context_str: str, intent: str, code_paste: str = "") -> Dict[str, Any]:
         """코드 수정 계획 생성 - 시간 예산 적용"""
         logger.info("PLAN 생성 시작...")
-        return self._gen_plan(context_str, intent, max_new_tokens=192, time_budget_s=70)
+        return self._gen_plan(context_str, intent, max_new_tokens=24, time_budget_s=30)
 
     def patch(self, plan_json: Dict[str, Any], feedback: str = "") -> Dict[str, Any]:
         """
@@ -406,7 +516,7 @@ class Model:
             "["                                          # 배열 여는 대괄호까지 강제
         )
 
-        raw = self._gen_with_prefix(prefix, max_new_tokens=768, time_budget_s=90)
+        raw = self._gen_with_streamer_for_patch(prefix, time_budget_s=90)
 
         # 센티넬 컷
         if END_MARK in raw:
@@ -541,6 +651,67 @@ class Model:
         full = self.tokenizer.decode(out[0], skip_special_tokens=True)
         return full[len(prefix):]  # suffix만 반환
 
+    # --- 스트리밍 + 배열 균형 조기 정지 (PATCH 전용) ---
+    class _StopOnBalancedJson(StoppingCriteria):
+        def __init__(self, buf, t0, budget_s=60):
+            self.buf = buf
+            self.t0 = t0
+            self.budget = budget_s
+        def __call__(self, input_ids, scores, **kwargs):
+            # 시간 예산
+            if time.time() - self.t0 > self.budget:
+                return True
+            s = "".join(self.buf)
+            txt = s.replace("```", "").strip()
+            i = txt.find("[")
+            if i >= 0:
+                depth = 0
+                in_str = False
+                esc = False
+                for ch in txt[i:]:
+                    if in_str:
+                        if esc:
+                            esc = False
+                        elif ch == "\\":
+                            esc = True
+                        elif ch == '"':
+                            in_str = False
+                    else:
+                        if ch == '"':
+                            in_str = True
+                        elif ch == '[':
+                            depth += 1
+                        elif ch == ']':
+                            depth -= 1
+                            if depth == 0:
+                                return True
+            return False
+
+    def _gen_with_streamer_for_patch(self, prefix: str, time_budget_s: int = 60) -> str:
+        """TextIteratorStreamer로 스트리밍하며 edits 배열이 닫히면 즉시 정지."""
+        streamer = TextIteratorStreamer(self.tokenizer, skip_prompt=True, skip_special_tokens=True)
+        buf: list[str] = []
+
+        def _collector():
+            for t in streamer:
+                buf.append(t)
+
+        th = threading.Thread(target=_collector, daemon=True)
+        th.start()
+
+        inputs = self.tokenizer(prefix, return_tensors="pt", add_special_tokens=False).to(self.model.device)
+        t0 = time.time()
+        stopper = Model._StopOnBalancedJson(buf, t0, budget_s=time_budget_s)
+
+        with torch.inference_mode():
+            gen_kwargs = dict(self.PATCH_GEN_KW)
+            gen_kwargs["stopping_criteria"] = StoppingCriteriaList([stopper])
+            gen_kwargs["streamer"] = streamer
+            self.model.generate(**inputs, **gen_kwargs)
+
+        th.join(timeout=1.0)
+        return "".join(buf)
+
     def _balanced_json(self, s: str):
         """균형 중괄호 블록을 복구 (기존 호환성 유지)"""
         stack = 0
@@ -583,4 +754,14 @@ class Model:
             })
         
         return info
+
+# ---- 모델 싱글톤 보장 ----
+_MODEL_SINGLETON = None
+
+def get_model():
+    global _MODEL_SINGLETON
+    if _MODEL_SINGLETON is None:
+        m = Model()            # ← 기존에 쓰던 Model 클래스 (__init__에서 자동 로딩)
+        _MODEL_SINGLETON = m
+    return _MODEL_SINGLETON
 

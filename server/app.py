@@ -46,14 +46,8 @@ logger = logging.getLogger(__name__)
 # .env 로드
 load_dotenv()
 
-app = FastAPI(
-    title="Qwen3-8B Local Coding AI",
-    description="로컬에서 실행되는 AI 코딩 어시스턴트",
-    version="1.0.0"
-)
-
-@app.on_event("startup")
-def _startup():
+@asynccontextmanager
+async def lifespan(app: FastAPI):
     global model, debug_runtime
     logger.info("🚀 서버 시작")
     if torch.cuda.is_available():
@@ -63,17 +57,13 @@ def _startup():
     else:
         logger.warning("⚠️ CUDA 사용 불가, CPU 모드로 실행")
 
-    # 시작 시 베이스 모델을 1회만 로드하여 보관
     base, t, q = load_model_once()
-    app.state.base_model = base  # 베이스 모델 보관
+    app.state.base_model = base
     app.state.tok = t
     app.state.quant = q
-    
-    # v0로 시작 (어댑터 미적용)
     app.state.model = base
     app.state.adapter_path = "__none__"
 
-    # 운영 플래그/설정
     try:
         app.state.clean_response_enabled = bool(int(os.getenv("CLEAN_RESP", "1")))
     except Exception:
@@ -83,14 +73,12 @@ def _startup():
     except Exception:
         app.state.ollama_ctx_chars = 2000
 
-    # ADAPTER_PATH가 지정되면 부트시에만 래퍼를 씌워줌
     adp = os.getenv("ADAPTER_PATH", "training/qlora-out/adapter")
     if adp and adp != "__none__" and os.path.isdir(adp):
         from peft import PeftModel
         app.state.model = PeftModel.from_pretrained(base, adp).eval()
         app.state.adapter_path = adp
 
-    # 어댑터 메타정보 캐싱 (health 노출용)
     try:
         ai = get_adapter_info()
         app.state.adapter_path = ai.get("path")
@@ -98,10 +86,29 @@ def _startup():
     except Exception:
         app.state.adapter_path = None
         app.state.adapter_version = None
-    model = Model()  # 기존 코드 의존성 호환 목적 (get_device_info 등)
+
+    model = Model()
     debug_runtime = DebugRuntime()
     torch.backends.cuda.matmul.allow_tf32 = True
     logger.info("🎉 서버 시작 완료!")
+
+    try:
+        yield
+    finally:
+        try:
+            if debug_runtime:
+                debug_runtime.cleanup_all()
+        except Exception:
+            pass
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+app = FastAPI(
+    title="Qwen3-8B Local Coding AI",
+    description="로컬에서 실행되는 AI 코딩 어시스턴트",
+    version="1.0.0",
+    lifespan=lifespan
+)
 
 def _free_cuda():
     """CUDA 캐시 정리 및 가비지 컬렉션"""
@@ -360,24 +367,7 @@ class DebugResponse(BaseModel):
 
 # startup_event 제거 - lifespan에서 처리
 
-@app.on_event("shutdown")
-async def shutdown_event():
-    """서버 종료 시 정리"""
-    global model, debug_runtime
-    
-    try:
-        if model:
-            del model
-        if debug_runtime:
-            debug_runtime.cleanup_all()
-        
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        
-        logger.info("✅ 서버 정리 완료")
-        
-    except Exception as e:
-        logger.error(f"❌ 서버 정리 실패: {e}")
+ 
 
 @app.get("/health")
 async def health_check():
@@ -880,15 +870,7 @@ async def global_exception_handler(request: Request, exc: Exception):
 from server.ollama_api import router as ollama_router
 app.include_router(ollama_router)
 
-# 또는 기존 방식을 사용한다면
-@app.on_event("shutdown")
-async def shutdown_event():
-    try:
-        if hasattr(debug_runtime, 'cleanup_all'):
-            debug_runtime.cleanup_all()
-        logger.info("✅ 서버 정리 완료")
-    except Exception as e:
-        logger.error(f"❌ 서버 정리 실패: {e}")
+# lifespan으로 정리 처리
 
 if __name__ == "__main__":
     import uvicorn

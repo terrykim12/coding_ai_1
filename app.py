@@ -4,11 +4,23 @@
 Single entry that exposes the FastAPI app from server.app
 """
 
-from server.app import app  # noqa: F401
+from contextlib import asynccontextmanager
+from fastapi import FastAPI
+import torch
+from server.model import load_model_once
 
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="127.0.0.1", port=8765)
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    m, t, q = load_model_once()
+    app.state.model = m
+    app.state.tok = t
+    app.state.quant = q
+    torch.backends.cuda.matmul.allow_tf32 = True
+    yield
+
+from server.app import app as _server_app  # 기존 라우트/엔드포인트 포함
+_server_app.router.lifespan_context = lifespan  # lifespan 연결
+app = _server_app
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """

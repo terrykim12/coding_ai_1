@@ -30,6 +30,10 @@ _tok = None
 _lock = threading.Lock()
 _quant = "none"  # "4bit" | "8bit" | "none"
 
+# 어댑터 메타정보 (서버 /health 노출용)
+_adapter_path = None
+_adapter_version = None
+
 def _env_bool(name: str, default: bool = False) -> bool:
     v = os.getenv(name)
     if v is None:
@@ -41,7 +45,7 @@ def load_model_once():
     BitsAndBytesConfig로 4bit/8bit 양자화를 명시 적용하고, 단 한 번만 로드한다.
     반환: (model, tokenizer, quantization_mode)
     """
-    global _model, _tok, _quant
+    global _model, _tok, _quant, _adapter_path, _adapter_version
     if _model is not None:
         return _model, _tok, _quant
     with _lock:
@@ -82,6 +86,11 @@ def load_model_once():
         adapter_path = os.getenv("ADAPTER_PATH", "training/qlora-out/adapter")
         if adapter_path and os.path.exists(adapter_path):
             _model = PeftModel.from_pretrained(_model, adapter_path)
+            _adapter_path = adapter_path
+            try:
+                _adapter_version = os.path.getmtime(adapter_path)
+            except Exception:
+                _adapter_version = None
 
         # SDPA 강제 시도
         try:
@@ -97,6 +106,10 @@ def load_model_once():
             raise RuntimeError("Quantization not applied; would OOM on 12GB.")
 
         return _model, _tok, _quant
+
+def get_adapter_info() -> dict:
+    """로딩된 어댑터 경로와 버전(변경시각)을 반환"""
+    return {"path": _adapter_path, "version": _adapter_version}
 
 # ---- 시간 예산 스토핑 ---
 import time

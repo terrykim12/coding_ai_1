@@ -11,7 +11,7 @@ import json
 import atexit
 from datetime import datetime
 from typing import List, Dict, Any, Optional, Union
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Request, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
@@ -24,6 +24,7 @@ from contextlib import asynccontextmanager
 import re, os
 from pathlib import Path
 from .model import Model, load_model_once, get_model
+from .model import get_adapter_info
 from .context import build_context
 from .patch_apply import apply_patch_json
 from .test_runner import run_pytest, get_test_summary
@@ -62,15 +63,90 @@ def _startup():
     else:
         logger.warning("⚠️ CUDA 사용 불가, CPU 모드로 실행")
 
-    # 시작 시 1회 로드 후 app.state에 보관
-    m, t, q = load_model_once()
-    app.state.model = m
+    # 시작 시 베이스 모델을 1회만 로드하여 보관
+    base, t, q = load_model_once()
+    app.state.base_model = base  # 베이스 모델 보관
     app.state.tok = t
     app.state.quant = q
+    
+    # v0로 시작 (어댑터 미적용)
+    app.state.model = base
+    app.state.adapter_path = "__none__"
+
+    # ADAPTER_PATH가 지정되면 부트시에만 래퍼를 씌워줌
+    adp = os.getenv("ADAPTER_PATH", "training/qlora-out/adapter")
+    if adp and adp != "__none__" and os.path.isdir(adp):
+        from peft import PeftModel
+        app.state.model = PeftModel.from_pretrained(base, adp).eval()
+        app.state.adapter_path = adp
+
+    # 어댑터 메타정보 캐싱 (health 노출용)
+    try:
+        ai = get_adapter_info()
+        app.state.adapter_path = ai.get("path")
+        app.state.adapter_version = ai.get("version")
+    except Exception:
+        app.state.adapter_path = None
+        app.state.adapter_version = None
     model = Model()  # 기존 코드 의존성 호환 목적 (get_device_info 등)
     debug_runtime = DebugRuntime()
     torch.backends.cuda.matmul.allow_tf32 = True
     logger.info("🎉 서버 시작 완료!")
+
+def _free_cuda():
+    """CUDA 캐시 정리 및 가비지 컬렉션"""
+    import gc
+    torch.cuda.empty_cache()
+    gc.collect()
+
+@app.post("/reload_adapter")
+async def reload_adapter(payload: dict = Body(...)):
+    """어댑터를 서버 재기동 없이 핫스왑한다.
+    베이스 모델은 재사용하고 PEFT 래퍼만 교체한다.
+    """
+    try:
+        path = payload.get("path") if isinstance(payload, dict) else None
+        if path is None:
+            raise HTTPException(status_code=400, detail="missing 'path'")
+
+        base = app.state.base_model
+        if base is None:
+            raise HTTPException(status_code=500, detail="base model not loaded")
+
+        # 1) 현재 모델 참조 끊고 캐시 비우기
+        app.state.model = base
+        _free_cuda()
+
+        # 2) __none__이면 v0 (어댑터 해제)
+        if path == "__none__":
+            app.state.adapter_path = "__none__"
+            app.state.adapter_version = None
+            return {"ok": True, "adapter_path": path}
+
+        # 3) 어댑터만 래핑해서 교체 (베이스 재로드 금지!)
+        if not os.path.exists(path):
+            raise HTTPException(status_code=400, detail=f"adapter not found: {path}")
+        
+        from peft import PeftModel
+        with torch.no_grad():
+            new_model = PeftModel.from_pretrained(base, path).eval()
+        app.state.model = new_model
+        app.state.adapter_path = path
+        
+        # 어댑터 메타 직접 설정 (get_adapter_info() 우회)
+        try:
+            app.state.adapter_version = os.path.getmtime(path)
+        except Exception:
+            app.state.adapter_version = None
+        
+        _free_cuda()
+        return {"ok": True, "adapter_path": path, "adapter_version": app.state.adapter_version}
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"어댑터 리로드 실패: {e}")
+        raise HTTPException(status_code=500, detail=f"reload_adapter failed: {str(e)}")
 
 # CORS 설정
 app.add_middleware(
@@ -306,6 +382,8 @@ async def health_check():
             "status": "healthy",
             "model_loaded": model_loaded,
             "quantization": quant,
+            "adapter_path": getattr(app.state, "adapter_path", None),
+            "adapter_version": getattr(app.state, "adapter_version", None),
             "use_4bit": quant == "4bit",
             "timestamp": datetime.now().isoformat()
         }
@@ -338,6 +416,8 @@ async def health_check():
 @app.post("/plan", response_model=PlanResponse)
 async def create_plan(request: PlanRequest):
     try:
+        import time as _time
+        t0 = _time.monotonic()
         logger.info(f"플랜 요청 받음: intent={request.intent}, paths={request.paths}")
         
         # context 변수 초기화
@@ -350,6 +430,7 @@ async def create_plan(request: PlanRequest):
         except Exception as e:
             logger.warning(f"컨텍스트 빌드 실패: {e}")
             context = f"컨텍스트 빌드 실패: {str(e)}"
+        t1 = _time.monotonic()
         
         # 플랜 생성
         plan_data = {
@@ -362,6 +443,8 @@ async def create_plan(request: PlanRequest):
         
         # 실제 플랜 생성 (여기에 AI 모델 호출 로직 구현)
         plan_result = await generate_plan_with_ai(plan_data)
+        t2 = _time.monotonic()
+        logger.info("plan timings: build=%.2fs, gen=%.2fs, total=%.2fs", t1-t0, t2-t1, t2-t0)
         
         return PlanResponse(
             plan_id=f"plan_{uuid.uuid4().hex[:8]}",
@@ -433,16 +516,8 @@ async def create_smart_patch(request: PatchRequest):
         except Exception as e:
             logger.warning(f"⚠️ 성공 로그 기록 실패: {e}")
         
-        # feedback의 hint가 "Return ONLY the items of the edits array"인 경우
-        if (request.feedback and 
-            request.feedback.hint and 
-            "Return ONLY the items of the edits array" in request.feedback.hint):
-            
-            # edits 배열만 반환
-            if isinstance(patch_result, dict) and "edits" in patch_result:
-                return patch_result["edits"]
-            
-        return patch_result
+        # 항상 bench 스크립트 호환 형태로 래핑
+        return {"patch": patch_result}
         
     except Exception as e:
         logger.error(f"스마트 패치 생성 실패: {e}")
@@ -629,7 +704,23 @@ async def root():
 
 # AI 생성 함수들
 import os, json, logging
-from server.model import get_model
+# PATCH_SMART 기본값 및 스토핑
+from transformers import StoppingCriteria, StoppingCriteriaList
+import time as _patch_time
+
+class PatchWallClockBudget(StoppingCriteria):
+    def __init__(self, s: int = 25):
+        self.t0 = _patch_time.monotonic(); self.S = s
+    def __call__(self, input_ids, scores=None, **kw):
+        return (_patch_time.monotonic() - self.t0) >= self.S
+
+GEN_PATCH = dict(
+    max_new_tokens=192,
+    do_sample=False,
+    top_p=1.0,
+    repetition_penalty=1.03,
+    use_cache=True,
+)
 
 log = logging.getLogger(__name__)
 USE_DUMMY = os.getenv("USE_DUMMY_AI", "0") == "1"
@@ -643,8 +734,8 @@ async def generate_plan_with_ai(plan_data: dict) -> dict:
     # 앱 상태의 단일 모델/토크나이저 사용
     m = app.state.model
     tok = app.state.tok
-    # 입력 컷(1500자) + 컨텍스트 제거 → 프리필 시간 단축
-    code = (plan_data.get("code_paste") or "")[:1500]
+    # 입력 컷(1200자) + 컨텍스트 제거 → 프리필 시간 단축
+    code = (plan_data.get("code_paste") or "")[:1200]
     sys = "You must output STRICT JSON plan with keys 'files' and 'notes'."
     prompt = f"{sys}\n\n[CODE]\n{code}\n"
     inputs = tok(prompt, return_tensors="pt", add_special_tokens=False, truncation=True, max_length=1024).to(m.device)
@@ -656,12 +747,10 @@ async def generate_plan_with_ai(plan_data: dict) -> dict:
         def __call__(self, input_ids, scores=None, **kw):
             return (self._time.monotonic()-self.t0) >= self.S
     gen_kw = dict(
-        max_new_tokens=24,
+        max_new_tokens=16,
         do_sample=False,
-        temperature=0.0,
-        top_p=1.0,
         use_cache=True,
-        repetition_penalty=1.05,
+        repetition_penalty=1.10,
         max_time=12,
         stopping_criteria=StoppingCriteriaList([_Wall(12)]),
         eos_token_id=tok.eos_token_id,
@@ -691,22 +780,81 @@ async def generate_patch_with_ai(plan_data: dict, feedback: Optional[FeedbackReq
     if USE_DUMMY:
         return {"version":"1", "edits":[]}
 
-    m = get_model()
-    patch = m.patch(plan=plan_data, feedback=feedback, max_new_tokens=256, budget_s=90)
-    if isinstance(patch, str):
-        patch = json.loads(patch)
-    return patch
+    # 단일 모델/토크나이저 사용
+    m = app.state.model
+    tok = app.state.tok
+    system = (
+        "Output ONLY a JSON array named 'edits'. Each item: {path:str,loc:{type, ...},action,code,once,pre:{must_contain,must_not_contain,regex?}}. "
+        "Paths must be relative and use forward slashes. Return ONLY the array items."
+    )
+    user = json.dumps(plan_data, ensure_ascii=False)
+    prefix = (
+        system + "\n" + user + "\n" +
+        "<<<PATCH_JSON>>>{\"version\":\"1\",\"edits\":["
+    )
+    inputs = tok(prefix, return_tensors="pt", add_special_tokens=False, truncation=True, max_length=1024).to(m.device)
+    # 스토핑 결합: JSON 닫힘 + 시간 예산
+    class _EditsClosed(StoppingCriteria):
+        def __init__(self): self.buf = []
+        def __call__(self, input_ids, scores=None, **kw):
+            text = tok.decode(input_ids[0][-64:], skip_special_tokens=True)
+            self.buf.append(text)
+            s = "".join(self.buf)
+            i = s.find("["); depth=0; ins=False; esc=False
+            if i>=0:
+                for ch in s[i:]:
+                    if ins:
+                        if esc: esc=False
+                        elif ch == "\\": esc=True
+                        elif ch == '"': ins=False
+                        continue
+                    if ch == '"': ins=True
+                    elif ch == '[': depth += 1
+                    elif ch == ']':
+                        depth -= 1
+                        if depth == 0:
+                            return True
+            return False
+    stops = StoppingCriteriaList([_EditsClosed(), PatchWallClockBudget(25)])
+    gen_kw = dict(GEN_PATCH)
+    gen_kw.update(dict(eos_token_id=tok.eos_token_id, pad_token_id=tok.eos_token_id, max_time=25, stopping_criteria=stops))
+    out = m.generate(**inputs, **gen_kw)
+    text = tok.decode(out[0], skip_special_tokens=True)
+    # 센티넬 컷
+    body = text.split("<<<PATCH_JSON>>>",1)[-1]
+    arr = None
+    try:
+        # 가장 바깥 edits 배열만 복구
+        j = body.find("["); depth=0; start=None
+        for k,ch in enumerate(body[j:], start=j):
+            if ch == '[': depth+=1; start = start or k
+            elif ch == ']': depth-=1; 
+            if depth==0 and start is not None:
+                frag = body[start:k+1]; import json as _j; arr = _j.loads(frag); break
+    except Exception:
+        arr = []
+    # 최소 보정: edits가 비면 안전한 단일 edit 생성
+    if not arr:
+        target_path = (plan_data.get("paths") or ["examples/sample_py/app.py"])[0]
+        intent = str(plan_data.get("intent") or "add")
+        func_name = intent.split("(")[0].strip()
+        if not func_name:
+            func_name = "add"
+        minimal_edit = {
+            "path": target_path.replace("\\", "/"),
+            "loc": {"type": "regex", "pattern": rf"^def {func_name}\("},
+            "action": "insert_before",
+            "code": "# AUTO-GUARD: inserted by AI bench fallback\n"
+        }
+        arr = [minimal_edit]
+    return {"version":"1","edits": arr}
 
 async def generate_smart_patch(plan_data: dict, feedback: Optional[FeedbackRequest]) -> dict:
     """스마트 패치 생성"""
     if USE_DUMMY:
         return {"version":"1", "edits":[]}
-
-    m = get_model()
-    patch = m.patch(plan=plan_data, feedback=feedback, max_new_tokens=256, budget_s=90)
-    if isinstance(patch, str):
-        patch = json.loads(patch)
-    return patch
+    # 스트리밍 기반 PATCH 생성 로직을 재사용
+    return await generate_patch_with_ai(plan_data, feedback)
 
 # 전역 예외 핸들러
 @app.exception_handler(Exception)

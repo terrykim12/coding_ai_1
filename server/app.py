@@ -865,6 +865,10 @@ async def global_exception_handler(request: Request, exc: Exception):
         content={"detail": f"서버 내부 오류: {str(exc)}"}
     )
 
+# Ollama-like API 라우터 추가
+from server.ollama_api import router as ollama_router
+app.include_router(ollama_router)
+
 # 또는 기존 방식을 사용한다면
 @app.on_event("shutdown")
 async def shutdown_event():

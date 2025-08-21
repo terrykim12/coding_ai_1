@@ -3,6 +3,7 @@ param(
 	[Parameter(Mandatory=$true)][string]$Function,
 	[Parameter(Mandatory=$true)][string]$Intent,
 	[string]$Port = "8765",
+	[string]$TestPath,
 	[switch]$DryRun
 )
 $ErrorActionPreference = "Stop"
@@ -34,22 +35,52 @@ if(-not $patch.patch){
 	exit 1
 }
 
-# 디프(서버에서 details를 반환하지 않는 경우, 로컬 git diff로 대체)
-Write-Host "`n==== DIFF (git status) ====" -ForegroundColor Yellow
-git status --porcelain
+# 적용 단계 (/apply)
+$applyBody = @{ patch = $patch.patch; allowed_paths = @($Path); dry_run = [bool]$DryRun } | ConvertTo-Json -Depth 100 -Compress
+$apply = Invoke-RestMethod "http://127.0.0.1:$Port/apply" -Method Post -ContentType "application/json" -Body $applyBody -TimeoutSec 40
 
-Write-Host ("Result: edits={0}" -f ($patch.patch.edits | Measure-Object | Select-Object -ExpandProperty Count))
+# 결과 요약 및 디프 출력
+Write-Host ("Result: applied={0} skipped={1} failed={2} dry_run={3}" -f (
+    ($apply.applied | Measure-Object | Select-Object -ExpandProperty Count),
+    ($apply.skipped  | Measure-Object | Select-Object -ExpandProperty Count),
+    ($apply.failed   | Measure-Object | Select-Object -ExpandProperty Count),
+    $apply.dry_run
+))
 
-if($DryRun){ Write-Host "DryRun enabled. Skipping apply/test/commit." -ForegroundColor Yellow; exit 0 }
-
-# 간단 pytest 실행(있으면)
-if (Get-Command pytest -ErrorAction SilentlyContinue) {
-	try { Write-Host "`nRunning pytest..." -ForegroundColor Cyan; pytest -q } catch { Write-Warning "pytest failed: $($_.Exception.Message)" }
+if($apply.dry_run){
+    Write-Host "`n==== DRY-RUN: no changes written ====" -ForegroundColor Yellow
+} else {
+    Write-Host "`n==== DIFF (working tree) ====" -ForegroundColor Yellow
+    git --no-pager diff -- $Path | Write-Output
 }
 
-# 자동 커밋
-git add -- $Path
-git commit -m "auto-fix($Function): $Intent via PATCH_SMART" | Out-Null
-Write-Host "Committed." -ForegroundColor Green
+if($DryRun){ Write-Host "DryRun enabled. Skipping test/commit." -ForegroundColor Yellow; exit 0 }
+
+# 간단 pytest 실행(있으면)
+if ($DryRun) { exit 0 }
+
+# 테스트 경로 기본값: <파일 디렉터리>\tests 존재 시 사용
+if (-not $TestPath -or $TestPath.Trim() -eq "") {
+	$defaultTests = Join-Path (Split-Path $Path -Parent) "tests"
+	if (Test-Path $defaultTests) { $TestPath = $defaultTests }
+}
+
+$testsPassed = $true
+if ($TestPath -and (Get-Command pytest -ErrorAction SilentlyContinue)) {
+	Write-Host ("`nRunning pytest on {0}..." -f $TestPath) -ForegroundColor Cyan
+	pytest -q -- $TestPath
+	if ($LASTEXITCODE -ne 0) { $testsPassed = $false }
+}
+
+if ($testsPassed) {
+	git add -- $Path
+	git commit -m "auto-fix($Function): $Intent via PATCH_SMART" | Out-Null
+	Write-Host "Committed." -ForegroundColor Green
+} else {
+	Write-Warning "Tests failed. Reverting changes to $Path."
+	git restore --staged -- $Path 2>$null
+	git checkout -- $Path
+	exit 1
+}
 
 

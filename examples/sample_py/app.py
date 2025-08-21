@@ -52,6 +52,9 @@ def multiply(a: Union[int, float], b: Union[int, float]) -> Union[int, float]:
     return a * b
 
 def divide(a: Union[int, float], b: Union[int, float]) -> Union[int, float]:
+    # ZERO-DIVISION GUARD
+    if b == 0:
+        raise ZeroDivisionError("divide(): b must not be zero")
     """
     두 숫자를 나눕니다.
     
@@ -220,4 +223,6 @@ if __name__ == "__main__":
     print(f"reverse_string('hello') = {reverse_string('hello')}")
     
     print("\nNote: Some functions have intentional bugs for testing purposes.")
+
+
 

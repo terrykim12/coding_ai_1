@@ -313,7 +313,7 @@ class PatchRequest(BaseModel):
 class PlanResponse(BaseModel):
     plan_id: str
     plan: Dict[str, Any]
-    raw_response: str
+    meta: Dict[str, Any] = Field(default_factory=dict)
 
 class PatchResponse(BaseModel):
     patch_id: str
@@ -448,10 +448,22 @@ async def create_plan(request: PlanRequest):
         t2 = _time.monotonic()
         logger.info("plan timings: build=%.2fs, gen=%.2fs, total=%.2fs", t1-t0, t2-t1, t2-t0)
         
+        meta: Dict[str, Any] = {}
+        try:
+            m = app.state.model
+            meta = {
+                "quantization": getattr(app.state, "quant", "unknown"),
+                "is_8bit": bool(getattr(m, "is_loaded_in_8bit", False)),
+                "is_4bit": bool(getattr(m, "is_loaded_in_4bit", False)),
+                "torch_dtype": str(getattr(m, "dtype", None) or getattr(next(m.parameters()), "dtype", None)),
+            }
+        except Exception:
+            meta = {"quantization": getattr(app.state, "quant", "unknown")}
+
         return PlanResponse(
             plan_id=f"plan_{uuid.uuid4().hex[:8]}",
             plan=plan_result,
-            raw_response="Generated with 4-bit quantization"
+            meta=meta,
         )
         
     except Exception as e:

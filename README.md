@@ -51,7 +51,7 @@ python -m uvicorn server.app:app --host 127.0.0.1 --port 8765 --workers 1 --log-
 - 8-bit 강제: `BitsAndBytesConfig(load_in_8bit=True)`
 - 디바이스 확정: `device_map={"":0}` 로 CPU offloading 방지
 - 메모리 단편화 완화: `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`
-- /health 필드: `model_loaded`, `quantization`, `use_4bit`, `adapter_path`, `adapter_version`
+- /health 필드: `model_loaded`, `quantization`, `use_4bit`, `adapter_path`, `adapter_version`, `clean_response`, `stop_think_default`
 
 ---
 
@@ -82,6 +82,38 @@ $fb = @{ hint="Return ONLY items of the edits array. No markdown."; reason="smok
 $patchBody = @{ plan=$planObj; feedback=$fb } | ConvertTo-Json -Depth 100
 $patch = irm "http://127.0.0.1:$port/patch_smart" -Method Post -ContentType 'application/json; charset=utf-8' -Body $patchBody -TimeoutSec 40
 ```
+
+---
+
+## Ollama-호환 API (간이)
+
+- 엔드포인트
+  - `POST /api/generate` — 단발 프롬프트
+  - `POST /api/chat` — 대화 메시지 배열
+
+- 요청 예시
+
+```powershell
+# 1) 단발
+$body = @{ prompt="Hello"; stream=$false; options=@{ num_predict=24; temperature=0.0 } } | ConvertTo-Json -Depth 10
+irm http://127.0.0.1:8765/api/generate -Method Post -ContentType application/json -Body $body -TimeoutSec 40
+
+# 2) 채팅
+$chat = @{ messages = @(@{ role="user"; content="Say hello" }); stream = $false; options = @{ num_predict = 24; temperature = 0.0 } } | ConvertTo-Json -Depth 10
+irm http://127.0.0.1:8765/api/chat -Method Post -ContentType application/json -Body $chat -TimeoutSec 40
+```
+
+- options
+  - `num_predict`(기본 24), `max_time`(기본 20), `stop_think`(기본 false), `system`(기본 no-think 시스템)
+
+- 운영 플래그(환경변수)
+  - `CLEAN_RESP=1|0` — 응답 클린업 토글(기본 1)
+  - `OLLAMA_CTX_CHARS` — 프롬프트 길이 컷(기본 2000)
+  - `ADAPTER_PATH` — PEFT 어댑터 경로(`__none__`이면 미적용)
+
+- 롤백/안전장치
+  - 클린 후 빈 응답이면 약한 클린 → 인용구 → 원문 순 폴백
+  - 필요 시 클린 비활성: `CLEAN_RESP=0`
 
 ---
 

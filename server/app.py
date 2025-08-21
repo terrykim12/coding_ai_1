@@ -73,6 +73,16 @@ def _startup():
     app.state.model = base
     app.state.adapter_path = "__none__"
 
+    # 운영 플래그/설정
+    try:
+        app.state.clean_response_enabled = bool(int(os.getenv("CLEAN_RESP", "1")))
+    except Exception:
+        app.state.clean_response_enabled = True
+    try:
+        app.state.ollama_ctx_chars = int(os.getenv("OLLAMA_CTX_CHARS", "2000"))
+    except Exception:
+        app.state.ollama_ctx_chars = 2000
+
     # ADAPTER_PATH가 지정되면 부트시에만 래퍼를 씌워줌
     adp = os.getenv("ADAPTER_PATH", "training/qlora-out/adapter")
     if adp and adp != "__none__" and os.path.isdir(adp):
@@ -385,6 +395,8 @@ async def health_check():
             "adapter_path": getattr(app.state, "adapter_path", None),
             "adapter_version": getattr(app.state, "adapter_version", None),
             "use_4bit": quant == "4bit",
+            "clean_response": getattr(app.state, "clean_response_enabled", True),
+            "stop_think_default": False,
             "timestamp": datetime.now().isoformat()
         }
         

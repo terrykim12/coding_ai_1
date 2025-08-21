@@ -29,3 +29,13 @@ dist/
 build/
 .env
 *.swp
+# bench & logs
+bench_results*.csv
+bench_history.csv
+logs/
+
+# success logs (학습 루프 산출)
+training/success_logs/*.jsonl
+
+# editor/backup
+**/*.backup.py

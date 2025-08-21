@@ -85,6 +85,30 @@ $patch = irm "http://127.0.0.1:$port/patch_smart" -Method Post -ContentType 'app
 
 ---
 
+## One‑click Demo Scripts (tools)
+
+### A) Auto Fix (PLAN → PATCH_SMART → test → commit)
+
+```powershell
+.\tools\auto_fix.ps1 -Path "examples\sample_py\app.py" -Function "divide" -Intent "0 나누기 방지 및 에러 메시지 개선"
+```
+
+동작: 스니펫 추출 → /plan → /patch_smart → pytest → 자동 커밋
+
+### B) Test Generator (pytest 파일 생성)
+
+```powershell
+.\tools\gen_tests.ps1 -Path "examples\sample_py\app.py" -Function "add"
+pytest -q
+```
+
+### C) PR Preview (브랜치/PR 본문 템플릿)
+
+```powershell
+.\tools\pr_template.ps1
+# 생성된 PR_BODY.md 내용을 GitHub PR 본문에 복붙
+```
+
 ## Ollama-호환 API (간이)
 
 - 엔드포인트

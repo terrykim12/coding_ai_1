@@ -729,7 +729,6 @@ class PatchWallClockBudget(StoppingCriteria):
 GEN_PATCH = dict(
     max_new_tokens=192,
     do_sample=False,
-    top_p=1.0,
     repetition_penalty=1.03,
     use_cache=True,
 )

@@ -147,21 +147,24 @@ class StopOnSeq(StoppingCriteria):
 
 
 def _extract_gen_opts(opts: Dict[str, Any]) -> Dict[str, Any]:
-    max_new = int(opts.get("num_predict", 24))  # ← 64 → 24
+    max_new = int(opts.get("num_predict", 24))
     temperature = float(opts.get("temperature", 0.0))
     top_p = float(opts.get("top_p", 1.0))
     rep = float(opts.get("repetition_penalty", 1.05))
     do_sample = not (temperature == 0.0 and top_p >= 1.0)
     max_time = float(opts.get("max_time", 20.0))
-    return dict(
+
+    base = dict(
         max_new_tokens=max_new,
-        do_sample=do_sample,
-        temperature=temperature,
-        top_p=top_p,
         repetition_penalty=rep,
         use_cache=True,
-        max_time=max_time,   # ← 시간만 넘기고, stopping_criteria는 엔드포인트에서 구성
+        max_time=max_time,   # 시간만 넘기고, stopping_criteria는 엔드포인트에서 구성
     )
+    if do_sample:
+        base.update(dict(do_sample=True, temperature=temperature, top_p=top_p))
+    else:
+        base.update(dict(do_sample=False))
+    return base
 
 
 def _normalize_role(role: str) -> str:

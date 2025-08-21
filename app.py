@@ -1,26 +1,19 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-Single entry that exposes the FastAPI app from server.app
-"""
-
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
-import torch
-from server.model import load_model_once
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    m, t, q = load_model_once()
-    app.state.model = m
-    app.state.tok = t
-    app.state.quant = q
-    torch.backends.cuda.matmul.allow_tf32 = True
+    # TODO: add startup logic if needed
     yield
+    # TODO: add shutdown logic if needed
 
-from server.app import app as _server_app  # 기존 라우트/엔드포인트 포함
-_server_app.router.lifespan_context = lifespan  # lifespan 연결
-app = _server_app
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Single entry that re-exports the FastAPI app from server.app
+"""
+
+from server.app import app  # noqa: F401
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
@@ -199,8 +192,6 @@ class DebugResponse(BaseModel):
     message: str
     debug_port: Optional[int]
     processes: List[Dict[str, Any]]
-
-@app.on_event("startup")
 async def startup_event():
     """서버 시작 시 모델 로딩"""
     global model, debug_runtime
@@ -229,8 +220,6 @@ async def startup_event():
     except Exception as e:
         logger.error(f"❌ 서버 시작 실패: {e}")
         raise
-
-@app.on_event("shutdown")
 async def shutdown_event():
     """서버 종료 시 정리"""
     global model, debug_runtime
@@ -709,4 +698,5 @@ async def root():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="127.0.0.1", port=8765)
+
 
